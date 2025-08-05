@@ -1,0 +1,16 @@
+{
+  "last_known_device": {
+    "camera_info": {
+      "model": "HERO10 Black",
+      "serial": "C3461350525924",
+      "firmware": "H21.01.01.62.00"
+    },
+    "connected_at": 73698.390317083,
+    "device_fingerprint": "HERO10_Black_C3461350525924_H21.01.01.62.00"
+  },
+  "saved_at": 73698.390408625,
+  "version": "1.0",
+  "wifi_credentials": {
+    "HERO10 Black": "Xgk-cvd-ztG"
+  }
+}
