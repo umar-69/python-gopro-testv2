@@ -91,6 +91,8 @@ class GoProController:
                 # TIER 2: WiFi+COHN combined approach (most stable)
                 if saved_device:
                     logging.info("TIER 2: Attempting WiFi+COHN combined connection")
+                    # Ensure WiFi AP is available before attempting combined connection
+                    await self._ensure_wifi_ap_available()
                     result = await self.connect_wifi_cohn_combined()
                     if result["success"]:
                         return result
@@ -245,6 +247,131 @@ class GoProController:
             logging.debug(f"Could not read COHN database: {e}")
             return False
 
+    async def _check_gopro_wifi_available(self) -> bool:
+        """Check if GoPro WiFi AP is available/broadcasting"""
+        try:
+            # Method 1: Try using airport command for network scanning (most reliable)
+            try:
+                result = await asyncio.create_subprocess_exec(
+                    '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport',
+                    '-s',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                stdout, _ = await asyncio.wait_for(result.communicate(), timeout=10)
+                networks = stdout.decode()
+                
+                # Look for GoPro networks in scan results
+                gopro_patterns = ['GoPro', 'HERO']
+                for pattern in gopro_patterns:
+                    if pattern in networks:
+                        logging.info(f"Found GoPro WiFi AP broadcasting: {pattern}")
+                        return True
+                        
+            except Exception as e:
+                logging.debug(f"Airport scan failed: {e}")
+            
+            # Method 2: Fallback using networksetup (less reliable for scanning)
+            try:
+                # Get WiFi interface name
+                result = await asyncio.create_subprocess_exec(
+                    'networksetup', '-listallhardwareports',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                stdout, _ = await result.communicate()
+                
+                wifi_interface = 'en0'  # Default
+                lines = stdout.decode().split('\n')
+                for i, line in enumerate(lines):
+                    if 'Wi-Fi' in line and i + 1 < len(lines):
+                        device_line = lines[i + 1]
+                        if 'Device:' in device_line:
+                            wifi_interface = device_line.split(':')[1].strip()
+                            break
+                
+                # Try to scan current network and nearby networks  
+                result = await asyncio.create_subprocess_exec(
+                    'networksetup', '-getairportnetwork', wifi_interface,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                stdout, _ = await result.communicate()
+                current_network = stdout.decode().strip()
+                
+                # Check if already connected to GoPro network
+                gopro_patterns = ['GoPro', 'HERO']
+                for pattern in gopro_patterns:
+                    if pattern in current_network:
+                        logging.info(f"Already connected to GoPro WiFi: {current_network}")
+                        return True
+                        
+            except Exception as e:
+                logging.debug(f"NetworkSetup scan failed: {e}")
+            
+            # Method 3: Direct ping test to see if GoPro is reachable
+            try:
+                ping_result = await asyncio.create_subprocess_exec(
+                    'ping', '-c', '1', '-W', '1000', '10.5.5.9',
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await asyncio.wait_for(ping_result.wait(), timeout=3)
+                if ping_result.returncode == 0:
+                    logging.info("GoPro reachable at 10.5.5.9 - WiFi AP likely available")
+                    return True
+            except Exception as e:
+                logging.debug(f"Ping test failed: {e}")
+            
+            logging.info("GoPro WiFi AP not detected by any method")
+            return False
+            
+        except Exception as e:
+            logging.debug(f"WiFi availability check failed: {e}")
+            return False
+
+    async def _wake_wifi_via_ble(self) -> bool:
+        """Wake WiFi AP using BLE commands"""
+        try:
+            logging.info("Attempting to wake WiFi via BLE...")
+            
+            # Create a temporary BLE-only connection for wake command
+            wake_gopro = WirelessGoPro(
+                interfaces={WirelessGoPro.Interface.BLE},
+                target=self._get_camera_target()
+            )
+            
+            # Connect with short timeout
+            await asyncio.wait_for(wake_gopro.open(timeout=10, retries=1), timeout=15)
+            
+            # Enable WiFi AP via BLE command
+            await asyncio.wait_for(
+                wake_gopro.ble_command.enable_wifi_ap(),
+                timeout=10
+            )
+            logging.info("BLE command sent to enable WiFi AP")
+            
+            # Give WiFi time to come online
+            await asyncio.sleep(3)
+            
+            # Clean up BLE connection
+            await wake_gopro.close()
+            
+            # Wait a bit more for AP to stabilize
+            await asyncio.sleep(2)
+            
+            logging.info("WiFi AP wake via BLE completed")
+            return True
+            
+        except Exception as e:
+            logging.warning(f"BLE WiFi wake failed: {e}")
+            try:
+                if 'wake_gopro' in locals():
+                    await wake_gopro.close()
+            except:
+                pass
+            return False
+
     async def _wake_wifi(self) -> bool:
         """
         Hit the GoPro's pair/complete endpoint so that after a reboot
@@ -272,6 +399,49 @@ class GoProController:
                 return success
         except Exception as e:
             logging.warning(f"Failed to wake GoPro WiFi: {e}")
+            return False
+
+    async def _ensure_wifi_ap_available(self) -> bool:
+        """Ensure GoPro WiFi AP is available, wake if necessary"""
+        try:
+            # First check if WiFi AP is already broadcasting
+            if await self._check_gopro_wifi_available():
+                logging.info("GoPro WiFi AP already available")
+                return True
+            
+            logging.info("GoPro WiFi AP not detected, attempting to wake...")
+            
+            # Try BLE wake first (works even if not on GoPro network)
+            target = self._get_camera_target()
+            if target:
+                if await self._wake_wifi_via_ble():
+                    # Verify AP came online
+                    await asyncio.sleep(2)  # Give it time to broadcast
+                    if await self._check_gopro_wifi_available():
+                        logging.info("WiFi AP successfully awakened via BLE")
+                        return True
+                    else:
+                        logging.warning("BLE wake succeeded but AP still not detected")
+            
+            # Fallback to HTTP wake (requires being on GoPro network)
+            logging.info("Trying HTTP wake as fallback...")
+            saved_device = self._load_device_info()
+            if saved_device:
+                camera_ssid = saved_device.get("camera_info", {}).get("model", "HERO10 Black")
+                # Try to join WiFi first
+                if await self._try_os_paired_wifi(camera_ssid):
+                    if await self._wake_wifi():
+                        # Check if AP is now available
+                        await asyncio.sleep(2)
+                        if await self._check_gopro_wifi_available():
+                            logging.info("WiFi AP successfully awakened via HTTP")
+                            return True
+            
+            logging.warning("Failed to wake WiFi AP using both BLE and HTTP methods")
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error ensuring WiFi AP availability: {e}")
             return False
 
     async def _wait_for_gopro_dhcp(self) -> bool:
@@ -345,6 +515,12 @@ class GoProController:
                 logging.info(f"Already connected to GoPro WiFi: {current_network}")
                 return True
             
+            # Check if GoPro WiFi is available before trying to connect
+            logging.info("Checking if GoPro WiFi AP is available before attempting connection...")
+            if not await self._check_gopro_wifi_available():
+                logging.info("GoPro WiFi AP not available - cannot connect with password")
+                return False
+            
             # Load saved WiFi credentials from cohn_db.json
             wifi_credentials = self._load_gopro_wifi_credentials()
             
@@ -388,6 +564,66 @@ class GoProController:
             return False
         except Exception as e:
             logging.warning(f"OS-paired WiFi check failed: {e}")
+            return False
+
+    async def _connect_to_gopro_wifi_direct(self, camera_ssid: str) -> bool:
+        """Connect to GoPro WiFi directly (assumes availability already validated)"""
+        try:
+            # Check if we're already connected to the GoPro's network
+            result = await asyncio.create_subprocess_exec(
+                'networksetup', '-getairportnetwork', 'en0',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await result.communicate()
+            current_network = stdout.decode().strip()
+            
+            if camera_ssid in current_network:
+                logging.info(f"Already connected to GoPro WiFi: {current_network}")
+                return True
+            
+            # Load saved WiFi credentials from cohn_db.json
+            wifi_credentials = self._load_gopro_wifi_credentials()
+            
+            # Try to connect to known GoPro networks with passwords
+            gopro_networks = [camera_ssid, "HERO10 Black", "GoPro 5924"]
+            
+            for network in gopro_networks:
+                try:
+                    logging.info(f"Trying to connect to WiFi network: {network}")
+                    
+                    # Get password for this network - always required for GoPro
+                    password = wifi_credentials.get(network)
+                    if not password:
+                        logging.info(f"No password found for {network}, skipping (GoPro networks always require password)")
+                        continue
+                    
+                    logging.info(f"Using saved password for {network}")
+                    cmd = ['networksetup', '-setairportnetwork', 'en0', network, password]
+                    
+                    # Attempt to connect to the network
+                    result = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await asyncio.wait_for(result.wait(), timeout=8)
+                    
+                    if result.returncode == 0:
+                        # Wait a moment for connection to establish
+                        await asyncio.sleep(3)
+                        logging.info(f"WiFi connection successful to: {network}")
+                        return True
+                    else:
+                        logging.warning(f"Failed to connect to {network} (return code: {result.returncode})")
+                        
+                except Exception as e:
+                    logging.debug(f"Failed to connect to {network}: {e}")
+                    continue
+            
+            return False
+        except Exception as e:
+            logging.warning(f"Direct WiFi connection failed: {e}")
             return False
 
     def _load_gopro_wifi_credentials(self) -> Dict[str, str]:
@@ -680,23 +916,18 @@ class GoProController:
         
         try:
             await self._cleanup_connection_thoroughly()
-            
-            # Step 0: Wake GoPro WiFi interface (critical after reboot)
             camera_ssid = saved_device.get("camera_info", {}).get("model", "HERO10 Black")
-            logging.info("Step 0: Waking GoPro WiFi interface after potential reboot...")
             
-            # First try to join WiFi to reach the wake endpoint
-            if await self._try_os_paired_wifi(camera_ssid):
-                # Now wake the WiFi interface
-                if not await self._wake_wifi():
-                    logging.warning("WiFi wake failed, but continuing with connection attempt")
-            else:
-                logging.warning("Could not join WiFi to wake interface, but continuing")
+            # Step 0: Ensure GoPro WiFi AP is available (wake if necessary)
+            logging.info("Step 0: Ensuring GoPro WiFi AP is available...")
+            if not await self._ensure_wifi_ap_available():
+                logging.warning("WiFi AP wake failed, but attempting connection anyway")
             
-            # Step 1: Ensure we're connected to WiFi (may need to reconnect after wake)
-            logging.info(f"Step 1: Ensuring WiFi connection to: {camera_ssid}")
-            if not await self._try_os_paired_wifi(camera_ssid):
-                return {"success": False, "message": "Failed to join WiFi network"}
+            # Step 1: Connect to WiFi network (skip availability check since we just ensured it)
+            logging.info(f"Step 1: Connecting to WiFi network: {camera_ssid}")
+            # Use direct OS wifi connection since we've already validated availability
+            if not await self._connect_to_gopro_wifi_direct(camera_ssid):
+                return {"success": False, "message": f"Failed to join WiFi network {camera_ssid}"}
             
             # Step 2: Wait for proper DHCP lease
             logging.info("Step 2: Waiting for DHCP lease...")
